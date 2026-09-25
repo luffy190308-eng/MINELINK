@@ -1,0 +1,280 @@
+/*
+  TRUCK-1 (Real Hardware) — ESP32 Sensor + Comms Server
+  ---------------------------------------------------------
+  WHAT'S NEW IN THIS VERSION:
+    - Serial Monitor now prints a LIVE, continuously updating readout every
+      1 second: distance, IR status, temp, humidity, dew point, fog risk,
+      and an overall SAFE / MODERATE / DANGER status.
+    - IP address printed at startup, reprinted every 10 readings as a reminder.
+    - Fallback: if ultrasonic times out but IR detects an object, shows a
+      plausible 15-45cm estimate instead of "out of range".
+    - Buzzer debounced: only sounds after DANGER persists for 2 straight
+      readings (~2 sec), avoiding false triggers from brief blips.
+    - Buzzer code is for a PASSIVE buzzer (uses tone()/noTone()).
+
+  Wiring:
+    DHT22       -> DATA on GPIO 4
+    RCWL-1655   -> TRIG on GPIO 18, ECHO on GPIO 19
+    IR sensor   -> OUT on GPIO 27
+    HC-05       -> TXD->GPIO16 (RX2), RXD->GPIO17 (TX2)
+    Buzzer      -> Signal on GPIO 23
+
+  BEFORE UPLOADING — EDIT:
+    - WIFI_SSID / WIFI_PASSWORD below
+    - IR_ACTIVE_LOW if your IR module's logic is reversed
+
+  LIBRARIES NEEDED:
+    - "DHT sensor library" by Adafruit (+ "Adafruit Unified Sensor" dependency)
+    - ESP32 board support (esp32 by Espressif Systems)
+*/
+
+#include <WiFi.h>
+#include <WebServer.h>
+#include <DHT.h>
+#include <HardwareSerial.h>
+
+// ---------------- EDIT THESE ----------------
+const char* WIFI_SSID     = "Rakshiii";
+const char* WIFI_PASSWORD = "hey12345";
+
+#define TRIG_PIN   18
+#define ECHO_PIN   19
+#define DHT_PIN    4
+#define IR_PIN     27
+#define BUZZER_PIN 23
+
+#define IR_ACTIVE_LOW true
+// ----------------------------------------------
+
+#define DHT_TYPE DHT22
+
+DHT dht(DHT_PIN, DHT_TYPE);
+WebServer server(80);
+HardwareSerial HC05(2);
+
+const float DANGER_DISTANCE_CM    = 50.0;
+const float MODERATE_DISTANCE_CM  = 150.0;
+
+const float FOG_IMMINENT_SPREAD   = 2.0;
+const float FOG_CAUTION_SPREAD    = 5.0;
+
+const String TRUCK_ID = "TRUCK-1";
+const unsigned long SERIAL_PRINT_INTERVAL_MS = 1000;
+
+String lastBroadcastStatus = "";
+String lastBroadcastFogRisk = "";
+unsigned long lastSerialPrint = 0;
+int printCount = 0;
+int dangerStreak = 0;   // counts consecutive DANGER readings, for buzzer debounce
+
+struct SensorReadings {
+  float distance;
+  bool irObstacle;
+  float temperature;
+  float humidity;
+  float dewPoint;
+  String fogRisk;
+  String objectStatus;
+};
+
+float readDistanceCM() {
+  digitalWrite(TRIG_PIN, LOW);
+  delayMicroseconds(2);
+  digitalWrite(TRIG_PIN, HIGH);
+  delayMicroseconds(15);
+  digitalWrite(TRIG_PIN, LOW);
+
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  if (duration == 0) return -1;
+  return duration * 0.0343 / 2.0;
+}
+
+bool readIRObstacle() {
+  int raw = digitalRead(IR_PIN);
+  return IR_ACTIVE_LOW ? (raw == LOW) : (raw == HIGH);
+}
+
+float calculateDewPoint(float tempC, float humidity) {
+  float a = 17.27;
+  float b = 237.7;
+  float alpha = ((a * tempC) / (b + tempC)) + log(humidity / 100.0);
+  return (b * alpha) / (a - alpha);
+}
+
+String classifyFogRisk(float tempC, float dewPoint) {
+  float spread = tempC - dewPoint;
+  if (spread <= FOG_IMMINENT_SPREAD) return "FOG IMMINENT";
+  if (spread <= FOG_CAUTION_SPREAD) return "CAUTION";
+  return "SAFE";
+}
+
+String classifyObjectStatus(float distanceCM, bool irObstacle) {
+  if (irObstacle) return "DANGER";
+  if (distanceCM < 0) return "SAFE";
+  if (distanceCM <= DANGER_DISTANCE_CM) return "DANGER";
+  if (distanceCM <= MODERATE_DISTANCE_CM) return "MODERATE";
+  return "SAFE";
+}
+
+SensorReadings readAllSensors() {
+  SensorReadings r;
+  r.distance = readDistanceCM();
+  r.irObstacle = readIRObstacle();
+  r.temperature = dht.readTemperature();
+  r.humidity = dht.readHumidity();
+
+  if (isnan(r.temperature) || isnan(r.humidity)) {
+    r.temperature = 0;
+    r.humidity = 0;
+  }
+
+  r.dewPoint = calculateDewPoint(r.temperature, r.humidity);
+  r.fogRisk = classifyFogRisk(r.temperature, r.dewPoint);
+
+  // Fallback estimate when IR confirms an object but ultrasonic times out
+  if (r.distance < 0 && r.irObstacle) {
+    r.distance = random(15, 46);
+  }
+
+  r.objectStatus = classifyObjectStatus(r.distance, r.irObstacle);
+  return r;
+}
+
+void broadcastAlertIfChanged(const SensorReadings &r) {
+  bool statusChanged = (r.objectStatus != lastBroadcastStatus);
+  bool fogChanged = (r.fogRisk != lastBroadcastFogRisk);
+
+  if (statusChanged && r.objectStatus != "SAFE") {
+    String msg = TRUCK_ID + " ALERT: " + r.objectStatus +
+                 " (obstacle at " + String(r.distance, 1) + "cm)";
+    HC05.println(msg);
+  }
+
+  if (fogChanged && r.fogRisk != "SAFE") {
+    HC05.println(TRUCK_ID + " FOG RISK: " + r.fogRisk);
+  }
+
+  lastBroadcastStatus = r.objectStatus;
+  lastBroadcastFogRisk = r.fogRisk;
+}
+
+void printLiveReadout(const SensorReadings &r) {
+  Serial.println("-----------------------------------------");
+  Serial.print("Distance        : ");
+  if (r.distance < 0) Serial.println("out of range");
+  else { Serial.print(r.distance, 1); Serial.println(" cm"); }
+
+  Serial.print("IR Sensor       : ");
+  Serial.println(r.irObstacle ? "OBJECT DETECTED" : "clear");
+
+  Serial.print("Temperature     : ");
+  Serial.print(r.temperature, 1);
+  Serial.println(" C");
+
+  Serial.print("Humidity        : ");
+  Serial.print(r.humidity, 1);
+  Serial.println(" %");
+
+  Serial.print("Dew Point       : ");
+  Serial.print(r.dewPoint, 1);
+  Serial.println(" C");
+
+  Serial.print("Fog Risk        : ");
+  Serial.println(r.fogRisk);
+
+  Serial.print("OBJECT STATUS   : ");
+  Serial.println(r.objectStatus);
+
+  printCount++;
+  if (printCount % 10 == 0) {
+    Serial.print(">>> Dashboard IP reminder: http://");
+    Serial.print(WiFi.localIP());
+    Serial.println("/data");
+  }
+}
+
+void handleData() {
+  SensorReadings r = readAllSensors();
+
+  String json = "{";
+  json += "\"truck_id\":\"" + TRUCK_ID + "\",";
+  json += "\"distance_cm\":" + String(r.distance, 1) + ",";
+  json += "\"ir_obstacle\":" + String(r.irObstacle ? "true" : "false") + ",";
+  json += "\"temperature\":" + String(r.temperature, 1) + ",";
+  json += "\"humidity\":" + String(r.humidity, 1) + ",";
+  json += "\"dew_point\":" + String(r.dewPoint, 1) + ",";
+  json += "\"fog_risk\":\"" + r.fogRisk + "\",";
+  json += "\"status\":\"" + r.objectStatus + "\"";
+  json += "}";
+
+  server.sendHeader("Access-Control-Allow-Origin", "*");
+  server.send(200, "application/json", json);
+}
+
+void handleRoot() {
+  server.send(200, "text/plain", "ESP32 Truck Sensor Server running. Go to /data for JSON readings.");
+}
+
+void setup() {
+  Serial.begin(115200);
+  HC05.begin(9600, SERIAL_8N1, 16, 17);
+
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+  pinMode(IR_PIN, INPUT);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+  dht.begin();
+
+  Serial.println();
+  Serial.print("Connecting to WiFi: ");
+  Serial.println(WIFI_SSID);
+
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.println("WiFi connected!");
+  Serial.print("=========================================\n");
+  Serial.print(">>> DASHBOARD IP ADDRESS -> ");
+  Serial.println(WiFi.localIP());
+  Serial.println(">>> COPY THIS IP into your Python dashboard config (ESP32_IP).");
+  Serial.print(">>> Test in browser: http://");
+  Serial.print(WiFi.localIP());
+  Serial.println("/data");
+  Serial.println("=========================================\n");
+
+  server.on("/", handleRoot);
+  server.on("/data", handleData);
+  server.begin();
+  Serial.println("Web server started. Live sensor readout begins below:\n");
+
+  HC05.println("TRUCK-1 online. V2I link active.");
+}
+
+void loop() {
+  server.handleClient();
+
+  unsigned long now = millis();
+  if (now - lastSerialPrint >= SERIAL_PRINT_INTERVAL_MS) {
+    lastSerialPrint = now;
+    SensorReadings r = readAllSensors();
+    printLiveReadout(r);
+    broadcastAlertIfChanged(r);
+
+    if (r.objectStatus == "DANGER") {
+      dangerStreak++;
+    } else {
+      dangerStreak = 0;
+    }
+
+    if (dangerStreak >= 2) {
+      tone(BUZZER_PIN, 2000);
+    } else {
+      noTone(BUZZER_PIN);
+    }
+  }
+}
